@@ -64,7 +64,7 @@ offered are accepted: anything else the picker prints is rejected. Printing noth
 ## Limits
 
 - Windows and monitors only; no virtual monitors, no input injection, no RemoteDesktop.
-- The cursor is not part of a window picture: only "hidden" cursor mode is offered.
+- The cursor is never part of the picture. "Hidden" and "metadata" cursor modes are offered (no "embedded"). In metadata mode the stream carries the cursor's position, hotspot and bitmap (`SPA_META_Cursor`) and the app draws it: OBS and browsers do. It needs a jff with cursor capture sessions; with an older one the stream just has no cursor. Animated cursors only advance when jff's loop wakes for something else.
 - The stream is offered as BGRx (opaque) first and BGRA second. Both are written with a fully opaque alpha byte unless the consumer picked BGRA and the source really has alpha.
 - Pictures go through `wl_shm` and a CPU copy: fine for calls and recording, not for 4K at 60.
 - jff only sends a picture when the window changed; the last one is repeated for the consumer.

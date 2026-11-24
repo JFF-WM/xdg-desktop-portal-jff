@@ -22,16 +22,13 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{interface, Connection, ObjectServer};
 
 use crate::config::Config;
-use crate::model::{self, ChoiceError, Source};
+use crate::model::{self, ChoiceError, Source, CURSOR_HIDDEN, CURSOR_METADATA};
 use crate::stream::{self, PwStream};
 use crate::wayland::{self, CaptureEvent};
 
 const RESPONSE_OK: u32 = 0;
 const RESPONSE_CANCELLED: u32 = 1;
 const RESPONSE_OTHER: u32 = 2;
-
-/// The only cursor mode advertised by `AvailableCursorModes`.
-const CURSOR_HIDDEN: u32 = 1;
 
 type Results = HashMap<String, OwnedValue>;
 
@@ -271,7 +268,7 @@ impl ScreenCast {
             .get("restore_token")
             .and_then(|v| v.downcast_ref::<String>().ok());
 
-        let bad_cursor = cursor_mode.is_some_and(|m| m != CURSOR_HIDDEN);
+        let bad_cursor = cursor_mode.is_some_and(|m| !model::cursor_mode_offered(m));
         let bad_persist = persist_mode.is_some_and(|p| p > 2);
 
         // Apply the settings, then drop the guard before any await.
@@ -279,7 +276,7 @@ impl ScreenCast {
             let mut inner = lock(&session.inner);
             inner.types = model::effective_types(types);
             inner.multiple = multiple;
-            if let Some(mode) = cursor_mode.filter(|m| *m == CURSOR_HIDDEN) {
+            if let Some(mode) = cursor_mode.filter(|m| model::cursor_mode_offered(*m)) {
                 inner.cursor_mode = mode;
             }
             if let Some(pm) = persist_mode.filter(|p| *p <= 2) {
@@ -306,7 +303,8 @@ impl ScreenCast {
         // session. Do that after the lock is released.
         if bad_cursor {
             tracing::warn!(
-                "SelectSources: cursor_mode {cursor_mode:?} not advertised (only {CURSOR_HIDDEN}), closing session"
+                "SelectSources: cursor_mode {cursor_mode:?} not advertised (only {}), closing session",
+                model::AVAILABLE_CURSOR_MODES
             );
             close_session(&self.backend, session_handle.as_str(), true).await;
             return (RESPONSE_OTHER, Results::new());
@@ -399,10 +397,11 @@ impl ScreenCast {
         model::AVAILABLE_TYPES
     }
 
-    /// Hidden only: a window's picture never has a cursor.
+    /// Hidden, or metadata (the client draws the cursor itself, from the position, hotspot and
+    /// bitmap on the stream). Embedded is not offered: a window picture never has a cursor.
     #[zbus(property)]
     fn available_cursor_modes(&self) -> u32 {
-        CURSOR_HIDDEN
+        model::AVAILABLE_CURSOR_MODES
     }
 
     #[zbus(property, name = "version")]
@@ -519,7 +518,9 @@ async fn open_stream(
     let (events_tx, events_rx) = async_channel::unbounded::<CaptureEvent>();
     let wl = backend.wl.clone();
     let wanted = source.clone();
-    let started = blocking(move || wl.start(wanted, events_tx))
+    // Metadata mode: the cursor comes apart from the picture, on a capture session of its own.
+    let with_cursor = lock(&session.inner).cursor_mode == CURSOR_METADATA;
+    let started = blocking(move || wl.start(wanted, with_cursor, events_tx))
         .await
         .map_err(|e| format!("could not capture the source: {e:#}"))?;
 
@@ -528,8 +529,12 @@ async fn open_stream(
         backend.next_stream.fetch_add(1, Ordering::SeqCst)
     );
     let (width, height, frame, wl_id) = (started.width, started.height, started.frame, started.id);
+    let cursor = started.cursor;
+    if with_cursor && cursor.is_none() {
+        tracing::warn!("no cursor for {source:?}: the compositor gave no cursor session");
+    }
     jdbg!("dbus open_stream: source={source:?} capture size {width}x{height} wl_id={wl_id}");
-    let pw = match blocking(move || stream::start(name, width, height, frame)).await {
+    let pw = match blocking(move || stream::start(name, width, height, frame, cursor)).await {
         Ok(pw) => pw,
         Err(err) => {
             backend.wl.stop(wl_id);

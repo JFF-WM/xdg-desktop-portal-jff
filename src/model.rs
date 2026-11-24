@@ -9,6 +9,18 @@ pub const TYPE_WINDOW: u32 = 2;
 /// Both kinds jff-portal can capture (`AvailableSourceTypes`).
 pub const AVAILABLE_TYPES: u32 = TYPE_MONITOR | TYPE_WINDOW;
 
+/// `cursor_mode` bits of the ScreenCast portal. Embedded (2) is not offered: a window picture
+/// never has a cursor in it, and the client draws the one from the metadata.
+pub const CURSOR_HIDDEN: u32 = 1;
+pub const CURSOR_METADATA: u32 = 4;
+/// Both modes jff-portal can serve (`AvailableCursorModes`).
+pub const AVAILABLE_CURSOR_MODES: u32 = CURSOR_HIDDEN | CURSOR_METADATA;
+
+/// Whether `mode` is exactly one of the advertised cursor modes.
+pub fn cursor_mode_offered(mode: u32) -> bool {
+    mode.count_ones() == 1 && mode & AVAILABLE_CURSOR_MODES != 0
+}
+
 /// Something that can be shared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -268,6 +280,16 @@ mod tests {
 
     fn mon(name: &str) -> Source {
         Source::Monitor { name: name.into() }
+    }
+
+    #[test]
+    fn only_hidden_and_metadata_are_offered() {
+        assert!(cursor_mode_offered(CURSOR_HIDDEN));
+        assert!(cursor_mode_offered(CURSOR_METADATA));
+        // Embedded is not served, and a mode is one bit, not a set.
+        assert!(!cursor_mode_offered(2));
+        assert!(!cursor_mode_offered(5));
+        assert!(!cursor_mode_offered(0));
     }
 
     #[test]

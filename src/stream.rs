@@ -4,6 +4,10 @@
 //! The stream therefore keeps the latest picture (`wayland::FrameSlot`) and hands it out again
 //! every time the graph asks for a buffer. When the source changes size the stream renegotiates
 //! its format with the new size.
+//!
+//! In the portal's metadata cursor mode the stream also asks for a `SPA_META_Cursor` block on its
+//! buffers and fills it on every cycle: the cursor's position and hotspot (in the picture's
+//! pixels) and its bitmap, from `wayland::CursorFeed`. No id means "no cursor on this picture".
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -22,7 +26,7 @@ use pw::spa::utils::{Direction, Fraction, Rectangle, SpaTypes};
 use pw::stream::{StreamBox, StreamFlags, StreamState};
 
 use crate::model::{self, copy_rows};
-use crate::wayland::FrameSlot;
+use crate::wayland::{CursorFeed, FrameSlot};
 
 /// A running stream. Dropping it ends the stream and its thread.
 pub struct PwStream {
@@ -41,15 +45,30 @@ impl Drop for PwStream {
     }
 }
 
-/// Start a stream that shows `frame`, first at `width` by `height`. Returns once PipeWire has
-/// made the node (so the application can connect to its id).
-pub fn start(name: String, width: u32, height: u32, frame: FrameSlot) -> Result<PwStream> {
+/// Start a stream that shows `frame`, first at `width` by `height`, with the cursor as metadata
+/// when `cursor` is given. Returns once PipeWire has made the node (so the application can
+/// connect to its id).
+pub fn start(
+    name: String,
+    width: u32,
+    height: u32,
+    frame: FrameSlot,
+    cursor: Option<CursorFeed>,
+) -> Result<PwStream> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
     let (quit_tx, quit_rx) = pw::channel::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("pipewire".into())
         .spawn(move || {
-            if let Err(err) = run(name, width, height, frame, ready_tx.clone(), quit_rx) {
+            if let Err(err) = run(
+                name,
+                width,
+                height,
+                frame,
+                cursor,
+                ready_tx.clone(),
+                quit_rx,
+            ) {
                 let _ = ready_tx.send(Err(format!("{err:#}")));
                 tracing::error!("pipewire stream failed: {err:#}");
             }
@@ -73,6 +92,8 @@ pub fn start(name: String, width: u32, height: u32, frame: FrameSlot) -> Result<
 
 struct Data {
     frame: FrameSlot,
+    /// Where the cursor is and what it looks like, in metadata mode.
+    cursor: Option<CursorFeed>,
     /// The size the format was negotiated at.
     negotiated: Option<(u32, u32)>,
     /// A new format was offered and not agreed on yet.
@@ -89,6 +110,7 @@ fn run(
     width: u32,
     height: u32,
     frame: FrameSlot,
+    cursor: Option<CursorFeed>,
     ready: mpsc::Sender<Result<u32, String>>,
     quit: pw::channel::Receiver<()>,
 ) -> Result<()> {
@@ -117,6 +139,7 @@ fn run(
 
     let data = Data {
         frame,
+        cursor,
         negotiated: None,
         renegotiating: false,
         opaque: true,
@@ -164,13 +187,22 @@ fn run(
             data.opaque = info.format() != VideoFormat::BGRA;
             data.negotiated = Some((size.width, size.height));
             data.renegotiating = false;
-            if let Some(bytes) = buffers_pod(size.width, size.height) {
-                if let Some(pod) = Pod::from_bytes(&bytes) {
-                    let r = stream.update_params(&mut [pod]);
-                    jdbg!("pw buffers pod sent: {}x{} stride={} size={} bytes={} update_params={:?}", size.width, size.height, model::stride(size.width), model::stride(size.width) * size.height, bytes.len(), r.as_ref().map(|_| "ok"));
-                    if let Err(err) = r {
-                        tracing::warn!("could not set the buffer parameters: {err}");
-                    }
+            // The buffer layout and, in metadata mode, the cursor block the consumer may ask
+            // for: both go in one call, a later one replaces the earlier params.
+            let buffers_bytes = buffers_pod(size.width, size.height);
+            let meta_bytes = if data.cursor.is_some() {
+                cursor_meta_pod()
+            } else {
+                None
+            };
+            let mut pods: Vec<&Pod> = Vec::new();
+            pods.extend(buffers_bytes.as_deref().and_then(Pod::from_bytes));
+            pods.extend(meta_bytes.as_deref().and_then(Pod::from_bytes));
+            if !pods.is_empty() {
+                let r = stream.update_params(&mut pods);
+                jdbg!("pw buffers pod sent: {}x{} stride={} size={} params={} cursor_meta={} update_params={:?}", size.width, size.height, model::stride(size.width), model::stride(size.width) * size.height, pods.len(), meta_bytes.is_some(), r.as_ref().map(|_| "ok"));
+                if let Err(err) = r {
+                    tracing::warn!("could not set the buffer parameters: {err}");
                 }
             }
         })
@@ -207,13 +239,18 @@ fn run(
                 }
                 return;
             }
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            // The raw buffer, because the cursor block is in its metas, which the safe
+            // `Buffer` does not show. It goes back to the stream when `buffer` is dropped.
+            // SAFETY: the pointer comes from this stream's `dequeue_raw_buffer`.
+            let Some(buffer) = (unsafe { RawBuffer::dequeue(stream) }) else {
                 if log { jdbg!("pw process #{}: dequeue_buffer returned None", data.calls); }
                 return;
             };
-            let datas = buffer.datas_mut();
-            let Some(plane) = datas.first_mut() else {
-                if log { jdbg!("pw process #{}: buffer has no data planes", data.calls); }
+            if let Some(feed) = &data.cursor {
+                fill_cursor(buffer.ptr, feed);
+            }
+            let Some((plane_data, plane_chunk)) = buffer.first_plane() else {
+                if log { jdbg!("pw process #{}: buffer has no mapped data plane", data.calls); }
                 return;
             };
             let dst_stride = model::stride(frame_w) as usize;
@@ -225,8 +262,8 @@ fn run(
             let force_opaque = data.opaque || !source_has_alpha;
             let copied = {
                 let slot = data.frame.lock().unwrap_or_else(|e| e.into_inner());
-                let (Some(frame), Some(dst)) = (slot.as_ref(), plane.data()) else {
-                    if log { jdbg!("pw process #{}: no frame or plane.data() is None (buffer not mapped?)", data.calls); }
+                let (Some(frame), dst) = (slot.as_ref(), plane_data) else {
+                    if log { jdbg!("pw process #{}: no frame in the slot", data.calls); }
                     return;
                 };
                 let copied = copy_rows(
@@ -250,10 +287,9 @@ fn run(
                 }
                 copied
             };
-            let chunk = plane.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = dst_stride as i32;
-            *chunk.size_mut() = (dst_stride * copied) as u32;
+            plane_chunk.offset = 0;
+            plane_chunk.stride = dst_stride as i32;
+            plane_chunk.size = (dst_stride * copied) as u32;
             if log { jdbg!("pw process #{}: chunk offset=0 stride={} size={}", data.calls, dst_stride, dst_stride * copied); }
         })
         .register()
@@ -309,6 +345,163 @@ fn format_pod(width: u32, height: u32) -> Option<Vec<u8>> {
         ),
     );
     serialize(object)
+}
+
+/// A buffer taken from the stream with `dequeue_raw_buffer`, queued again when dropped.
+struct RawBuffer<'a> {
+    stream: &'a pw::stream::Stream,
+    ptr: *mut pw::sys::pw_buffer,
+}
+
+impl<'a> RawBuffer<'a> {
+    /// # Safety
+    /// Only inside the stream's `process` callback, where taking a buffer is allowed.
+    unsafe fn dequeue(stream: &'a pw::stream::Stream) -> Option<Self> {
+        let ptr = stream.dequeue_raw_buffer();
+        (!ptr.is_null()).then_some(Self { stream, ptr })
+    }
+
+    /// The first data plane's memory (mapped, `MAP_BUFFERS`) and its chunk, which says what part
+    /// of the memory holds the picture.
+    fn first_plane(&self) -> Option<(&mut [u8], &mut spa::sys::spa_chunk)> {
+        // SAFETY: `ptr` is a live buffer until `self` is dropped, the memory and the chunk are
+        // the ones PipeWire allocated for it, and nothing else touches them while it is out.
+        unsafe {
+            let buffer = (*self.ptr).buffer;
+            if buffer.is_null() || (*buffer).n_datas == 0 || (*buffer).datas.is_null() {
+                return None;
+            }
+            let plane = &mut *(*buffer).datas;
+            if plane.data.is_null() || plane.chunk.is_null() {
+                return None;
+            }
+            let memory =
+                std::slice::from_raw_parts_mut(plane.data.cast::<u8>(), plane.maxsize as usize);
+            Some((memory, &mut *plane.chunk))
+        }
+    }
+}
+
+impl Drop for RawBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `dequeue_raw_buffer` of this stream and is queued once.
+        unsafe { self.stream.queue_raw_buffer(self.ptr) };
+    }
+}
+
+/// Size of a `SPA_META_Cursor` block that has room for a `width` by `height` bitmap.
+fn cursor_meta_size(width: usize, height: usize) -> i32 {
+    (std::mem::size_of::<spa::sys::spa_meta_cursor>()
+        + std::mem::size_of::<spa::sys::spa_meta_bitmap>()
+        + width * height * 4) as i32
+}
+
+/// The cursor block a consumer may ask for: any size from 1x1 up to 1024x1024, 64x64 by default
+/// (what the consumers that read cursor metadata ask for themselves).
+fn cursor_meta_pod() -> Option<Vec<u8>> {
+    let object = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(
+                spa::sys::SPA_PARAM_META_type,
+                Value::Id(spa::utils::Id(spa::sys::SPA_META_Cursor)),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_META_size,
+                Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                    spa::utils::ChoiceFlags::empty(),
+                    spa::utils::ChoiceEnum::Range {
+                        default: cursor_meta_size(64, 64),
+                        min: cursor_meta_size(1, 1),
+                        max: cursor_meta_size(1024, 1024),
+                    },
+                ))),
+            ),
+        ],
+    };
+    serialize(object)
+}
+
+/// Write the cursor into the `SPA_META_Cursor` block of `raw`, if the consumer asked for one: its
+/// position (of the hotspot, in the picture's pixels), its hotspot and its bitmap (BGRA,
+/// premultiplied). A cursor that is not on the picture is `id` 0. A bitmap that does not fit the
+/// block the consumer allocated is left out (position only).
+fn fill_cursor(raw: *mut pw::sys::pw_buffer, feed: &CursorFeed) {
+    use spa::sys::{spa_meta_bitmap, spa_meta_cursor};
+    use std::mem::size_of;
+
+    if raw.is_null() {
+        return;
+    }
+    let pos = *feed.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let image = feed.image.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `raw` is the buffer PipeWire just gave us and `spa_buffer`, its metas and their
+    // data stay valid until it is queued again. Every write stays inside the `size` of the
+    // block, which is checked first.
+    unsafe {
+        let buffer = (*raw).buffer;
+        if buffer.is_null() || (*buffer).metas.is_null() {
+            return;
+        }
+        let metas = std::slice::from_raw_parts((*buffer).metas, (*buffer).n_metas as usize);
+        let Some(meta) = metas
+            .iter()
+            .find(|m| m.type_ == spa::sys::SPA_META_Cursor && !m.data.is_null())
+        else {
+            return;
+        };
+        let size = meta.size as usize;
+        if size < size_of::<spa_meta_cursor>() {
+            return;
+        }
+        let cursor = meta.data.cast::<spa_meta_cursor>();
+        let shown = image.as_ref().filter(|_| pos.on_source);
+        let Some(image) = shown else {
+            (*cursor).id = 0;
+            (*cursor).bitmap_offset = 0;
+            return;
+        };
+        // A new id with every new picture, never 0.
+        (*cursor).id = (image.seq % 0x7fff_ffff) as u32 + 1;
+        (*cursor).flags = 0;
+        (*cursor).position.x = pos.x;
+        (*cursor).position.y = pos.y;
+        (*cursor).hotspot.x = pos.hotspot_x;
+        (*cursor).hotspot.y = pos.hotspot_y;
+        (*cursor).bitmap_offset = 0;
+
+        let (width, height) = (image.width as usize, image.height as usize);
+        if width == 0 || height == 0 || size < cursor_meta_size(width, height) as usize {
+            return;
+        }
+        let bitmap_at = size_of::<spa_meta_cursor>();
+        let bitmap = meta
+            .data
+            .cast::<u8>()
+            .add(bitmap_at)
+            .cast::<spa_meta_bitmap>();
+        (*bitmap).format = VideoFormat::BGRA.as_raw();
+        (*bitmap).size.width = image.width;
+        (*bitmap).size.height = image.height;
+        (*bitmap).stride = (width * 4) as i32;
+        (*bitmap).offset = size_of::<spa_meta_bitmap>() as u32;
+        let pixels = std::slice::from_raw_parts_mut(
+            meta.data
+                .cast::<u8>()
+                .add(bitmap_at + size_of::<spa_meta_bitmap>()),
+            width * height * 4,
+        );
+        copy_rows(
+            &image.data,
+            image.stride as usize,
+            pixels,
+            width * 4,
+            width * 4,
+            height,
+        );
+        (*cursor).bitmap_offset = bitmap_at as u32;
+    }
 }
 
 /// What a buffer looks like: one block of `stride * height` bytes in shared memory.

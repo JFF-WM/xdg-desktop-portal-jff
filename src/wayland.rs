@@ -1,5 +1,7 @@
 //! The Wayland client side: asks jff what can be shared (`ext-foreign-toplevel-list-v1`, the
 //! monitors) and reads pictures of a source (`ext-image-copy-capture-v1`) into `wl_shm` buffers.
+//! For the portal's metadata cursor mode it also opens a cursor capture session on the same source
+//! (`create_pointer_cursor_session`): where the cursor is, its hotspot and its own picture.
 //!
 //! One thread owns the connection and every Wayland object. The rest of the program talks to it
 //! through a `Handle` (commands in, a pipe wakes the thread up) and gets pictures from a shared
@@ -15,6 +17,8 @@ use anyhow::{anyhow, Context as _, Result};
 use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
+use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::{self, WlShmPool};
@@ -30,6 +34,9 @@ use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_tople
 use wayland_protocols::ext::image_capture_source::v1::client::ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1;
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
 use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_cursor_session_v1::{
+    self, ExtImageCopyCaptureCursorSessionV1,
+};
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_frame_v1::{
     self, ExtImageCopyCaptureFrameV1, FailureReason,
 };
@@ -56,6 +63,28 @@ pub struct SharedFrame {
 
 pub type FrameSlot = Arc<Mutex<Option<SharedFrame>>>;
 
+/// Where the cursor is on a source, as the cursor session says it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CursorPos {
+    /// The cursor's picture touches the source (`enter` seen, no `leave` since). Hidden, typing
+    /// and a locked session count as off the source.
+    pub on_source: bool,
+    /// The cursor's hotspot in the source's pixels.
+    pub x: i32,
+    pub y: i32,
+    /// The hotspot's pixel inside the cursor's own picture.
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+}
+
+/// What a stream needs to publish the cursor: its position and its latest picture (`Argb8888`,
+/// premultiplied, `SharedFrame::seq` changes with every new picture).
+#[derive(Clone)]
+pub struct CursorFeed {
+    pub pos: Arc<Mutex<CursorPos>>,
+    pub image: FrameSlot,
+}
+
 /// What a capture reports back besides pictures.
 #[derive(Debug)]
 pub enum CaptureEvent {
@@ -69,12 +98,16 @@ pub struct Started {
     pub width: u32,
     pub height: u32,
     pub frame: FrameSlot,
+    /// Set when the cursor was asked for and the compositor gave a cursor session.
+    pub cursor: Option<CursorFeed>,
 }
 
 enum Command {
     List(mpsc::Sender<Vec<Source>>),
     Start {
         source: Source,
+        /// Also follow the cursor (the portal's metadata cursor mode).
+        cursor: bool,
         events: async_channel::Sender<CaptureEvent>,
         reply: mpsc::Sender<Result<Started, String>>,
     },
@@ -110,11 +143,13 @@ impl Handle {
     pub fn start(
         &self,
         source: Source,
+        cursor: bool,
         events: async_channel::Sender<CaptureEvent>,
     ) -> Result<Started> {
         let (tx, rx) = mpsc::channel();
         self.send(Command::Start {
             source,
+            cursor,
             events,
             reply: tx,
         })?;
@@ -201,6 +236,13 @@ struct Capture {
     events: async_channel::Sender<CaptureEvent>,
     /// Waiting for the first constraints to say how big the pictures are.
     reply: Option<mpsc::Sender<Result<Started, String>>>,
+    /// The capture that follows this one's cursor (its id), if the cursor was asked for.
+    cursor_id: Option<u64>,
+    /// On a window or monitor capture: handed to the stream. On a cursor capture: what its
+    /// events write to. The same `CursorFeed` (its `image` is the cursor capture's slot).
+    feed: Option<CursorFeed>,
+    /// Only on a cursor capture: the cursor session whose capture session this is.
+    cursor_session: Option<ExtImageCopyCaptureCursorSessionV1>,
 }
 
 struct State {
@@ -208,6 +250,10 @@ struct State {
     copy_manager: ExtImageCopyCaptureManagerV1,
     output_source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
     toplevel_source_manager: Option<ExtForeignToplevelImageCaptureSourceManagerV1>,
+    /// Not read: kept so the pointer stays alive.
+    _seat: Option<WlSeat>,
+    /// The seat's pointer, which a cursor session needs. jff accepts only its own seat's.
+    pointer: Option<WlPointer>,
     /// Not read: it is kept so the window list stays bound for as long as the program runs.
     _list: ExtForeignToplevelListV1,
     outputs: Vec<OutputEntry>,
@@ -238,6 +284,11 @@ fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
     let list: ExtForeignToplevelListV1 = globals
         .bind(&qh, 1..=1, ())
         .map_err(|_| missing("ext-foreign-toplevel-list-v1"))?;
+    // Only to get a `wl_pointer` for cursor sessions: its capabilities event gives it.
+    let seat: Option<WlSeat> = globals.bind(&qh, 1..=1, ()).ok();
+    if seat.is_none() {
+        tracing::warn!("no wl_seat: the cursor can't be shared");
+    }
     let output_source_manager = globals.bind(&qh, 1..=1, ()).ok();
     let toplevel_source_manager = globals.bind(&qh, 1..=1, ()).ok();
     if output_source_manager.is_none() {
@@ -254,6 +305,8 @@ fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
         copy_manager,
         output_source_manager,
         toplevel_source_manager,
+        _seat: seat,
+        pointer: None,
         _list: list,
         outputs: Vec::new(),
         toplevels: Vec::new(),
@@ -321,6 +374,7 @@ impl State {
     fn start_capture(
         &mut self,
         source: Source,
+        with_cursor: bool,
         events: async_channel::Sender<CaptureEvent>,
         reply: mpsc::Sender<Result<Started, String>>,
         qh: &QueueHandle<State>,
@@ -359,10 +413,55 @@ impl State {
         };
         let id = self.next_id;
         self.next_id += 1;
-        // No `paint_cursors`: a window picture has no cursor, and only hidden is advertised.
+        // No `paint_cursors`: the cursor is not in the picture. In metadata mode it comes from a
+        // cursor session on the same source.
         let session = self
             .copy_manager
             .create_session(&image_source, Options::empty(), qh, id);
+        let mut cursor_id = None;
+        let mut feed = None;
+        if with_cursor {
+            match self.pointer.clone() {
+                Some(pointer) => {
+                    let cid = self.next_id;
+                    self.next_id += 1;
+                    let cursor_session = self.copy_manager.create_pointer_cursor_session(
+                        &image_source,
+                        &pointer,
+                        qh,
+                        cid,
+                    );
+                    let cursor_capture = cursor_session.get_capture_session(qh, cid);
+                    let image: FrameSlot = Arc::new(Mutex::new(None));
+                    let shared = CursorFeed {
+                        pos: Arc::new(Mutex::new(CursorPos::default())),
+                        image: image.clone(),
+                    };
+                    // Nobody waits for this capture: if it ends, the stream just has no cursor.
+                    let (nobody, _) = async_channel::unbounded();
+                    self.captures.insert(
+                        cid,
+                        Capture {
+                            session: cursor_capture,
+                            machine: Machine::new(),
+                            buffer: None,
+                            frame: None,
+                            pixel: PixelFormat::Bgra,
+                            slot: image,
+                            seq: 0,
+                            events: nobody,
+                            reply: None,
+                            cursor_id: None,
+                            feed: Some(shared.clone()),
+                            cursor_session: Some(cursor_session),
+                        },
+                    );
+                    cursor_id = Some(cid);
+                    feed = Some(shared);
+                }
+                None => tracing::warn!("cursor asked for, but the seat has no pointer"),
+            }
+        }
         image_source.destroy();
         self.captures.insert(
             id,
@@ -376,14 +475,25 @@ impl State {
                 seq: 0,
                 events,
                 reply: Some(reply),
+                cursor_id,
+                feed,
+                cursor_session: None,
             },
         );
     }
 
     fn stop_capture(&mut self, id: u64) {
         if let Some(cap) = self.captures.remove(&id) {
-            cap.end();
+            self.end_with_cursor(cap);
         }
+    }
+
+    /// End a capture and the cursor capture that goes with it.
+    fn end_with_cursor(&mut self, cap: Capture) {
+        if let Some(cursor) = cap.cursor_id.and_then(|cid| self.captures.remove(&cid)) {
+            cursor.end();
+        }
+        cap.end();
     }
 
     fn session_event(&mut self, id: u64, event: Event, qh: &QueueHandle<State>) {
@@ -407,6 +517,7 @@ impl State {
                         width,
                         height,
                         frame: cap.slot.clone(),
+                        cursor: cap.feed.clone(),
                     }));
                 }
             }
@@ -472,7 +583,7 @@ impl State {
             let _ = reply.send(Err(why.clone()));
         }
         let _ = cap.events.try_send(CaptureEvent::Stopped(why));
-        cap.end();
+        self.end_with_cursor(cap);
     }
 }
 
@@ -531,6 +642,13 @@ impl Capture {
             frame.destroy();
         }
         self.session.destroy();
+        if let Some(cursor_session) = self.cursor_session.take() {
+            cursor_session.destroy();
+            // The cursor is no longer followed: do not leave it drawn where it was.
+            if let Some(feed) = &self.feed {
+                feed.pos.lock().unwrap_or_else(|e| e.into_inner()).on_source = false;
+            }
+        }
     }
 }
 
@@ -643,9 +761,10 @@ fn run(
                 }
                 Command::Start {
                     source,
+                    cursor,
                     events,
                     reply,
-                } => state.start_capture(source, events, reply, &qh),
+                } => state.start_capture(source, cursor, events, reply, &qh),
                 Command::Stop(id) => state.stop_capture(id),
             }
         }
@@ -869,6 +988,74 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, u64> for State {
             }
         }
         state.session_event(*id, mapped, qh);
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let has_pointer = matches!(
+                capabilities,
+                WEnum::Value(caps) if caps.contains(wl_seat::Capability::Pointer)
+            );
+            if has_pointer && state.pointer.is_none() {
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            } else if !has_pointer {
+                state.pointer = None;
+            }
+        }
+    }
+}
+
+// The pointer is only handed to `create_pointer_cursor_session`: its own events are not read.
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &WlPointer,
+        _: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// The cursor session's own events: where the cursor is on the source. The id is the cursor
+/// capture's.
+impl Dispatch<ExtImageCopyCaptureCursorSessionV1, u64> for State {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureCursorSessionV1,
+        event: ext_image_copy_capture_cursor_session_v1::Event,
+        id: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_image_copy_capture_cursor_session_v1::Event as E;
+        let Some(feed) = state.captures.get(id).and_then(|c| c.feed.as_ref()) else {
+            return;
+        };
+        let mut pos = feed.pos.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            E::Enter => pos.on_source = true,
+            E::Leave => pos.on_source = false,
+            E::Position { x, y } => {
+                pos.x = x;
+                pos.y = y;
+            }
+            E::Hotspot { x, y } => {
+                pos.hotspot_x = x;
+                pos.hotspot_y = y;
+            }
+            _ => {}
+        }
     }
 }
 
