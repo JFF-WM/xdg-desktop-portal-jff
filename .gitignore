@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local env / secrets
+.env
+.env.local
+
+# Build artifacts that may sneak in
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# macOS
+.AppleDouble
+.LSOverride
